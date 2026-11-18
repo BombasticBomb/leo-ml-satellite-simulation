@@ -1,87 +1,187 @@
-from bsk_rl import sats, scene, obs, act
+from typing import ClassVar
+
+import gymnasium as gym
+from Basilisk.architecture import bskLogging
 from Basilisk.utilities import macros, orbitalMotion, simIncludeGravBody
-from Basilisk.simulation import exponentialAtmosphere, spacecraft
-import os
+from Basilisk.simulation import radiationPressure
 
-#Choose a satellite profile, preferably a cubesat, and assign it mass, corss sectional area, fuel, etc
-class SimulationSatellite(sats.Satellite):
+from bsk_rl import act, data, obs, sats, scene
+from bsk_rl.sim import dyn, fsw
 
-    #Configuration
-    mass = 12 #in kg
-    inertia = [0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.3] # kg*m^2
+import numpy as np
+import random
+
+
+
+bskLogging.setDefaultLogLevel(bskLogging.BSK_WARNING)
+
+
+
+
+#Importing means it already includes J2 and Drag
+class ScientificDynamics(dyn.ContinuousImagingDynModel):
+    def __init__(self, satellite, sim_rate, **kwargs):
+        super().__init__(satellite, sim_rate, **kwargs)
+
+        #Initialize Basilisk Solar Radiation Pressure
+        self.srpEffector = radiationPressure.RadiationPressure()
+        self.srpEffector.ModelTag = f"{satellite.name}_SRP"
+        self.srpEffector.setUseCannonballModel() #Appoximate by treating it as a round ball
+        self.srpEffector.area = 0.1 #Tune later
+        self.srpEffector.coefficientReflection = 1.2
+
+        # Fetch the Sun's planet state message from the simulation world environment
+        sun_index = self.world.sun_index
+        sun_msg = self.world.gravFactory.spiceObject.planetStateOutMsgs[sun_index]
+        self.srpEffector.sunEphmInMsg.subscribeTo(sun_msg)
+        
+        # Attach the SRP effector to the satellite's core spacecraft physical model
+        self.scObject.addDynamicEffector(self.srpEffector)
+
+
+
+class MySatellite(sats.AccessSatellite):
+    # Physical and aerodynamic properties for scientific rigor
+    mass = 11.0  # kg
+    inertia = [0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.3]  # kg*m^2
     panelArea = 0.1  # m^2 cross-sectional area for drag
-    dragCoeff = 2.2  # calculate and input later
+    dragCoeff = 2.2  # Aerodynamic drag coefficient
 
-    #Initial Orbital Elements (550 km altitude, circular, 53-degree inclination)
-    oe = [
-        6378137.0 + 550000.0,  # Semi-major axis (meters)
-        0.0001,                 # Eccentricity (near-circular)
-        53.0 * macros.D2R,      # Inclination
-        12.0 * macros.D2R,      # Right Ascension of the Ascending Node (RAAN)
-        0.0,                    # Argument of Perigee
-        0.0                     # True Anomaly
+    observation_spec: ClassVar[list[obs.Observation]] = [
+        obs.SatProperties(
+            dict(prop="storage_level_fraction"),
+            dict(prop="battery_charge_fraction"),
+            dict(prop="r_BN_P", norm=orbitalMotion.REQ_EARTH * 1e3),
+            dict(prop="v_BN_P", norm=7616.5),
+        ),
+        obs.Eclipse(),
     ]
 
-    #Observational spec for neural network
-    observation_spec = [
-        obs.SatProperties(dict(prop="r_BN_P", norm=orbitalMotion.REQ_EARTH * 1e3)),
-        obs.SatProperties(dict(prop="v_BN_P", norm=7616.5)),
-        obs.Fuel(),
+    action_spec: ClassVar[list[act.Action]] = [
+        act.Scan(duration=60.0),
+        act.Charge(duration=600.0),
     ]
 
-    action_spec = [
-        act.ContinuousThrust(n_h=3)
-    ]
+    dyn_type = ScientificDynamics
+    fsw_type = fsw.ContinuousImagingFSWModel
 
-class RigorousEnvironment(scene.GeneralAstrodynamicsEnv):
-    #Custom environment with proper astrodynamics
-    def configure(self):
-        super().configure()
+    def eci_data(self):
+        sc_state_payload = self.dyn.scObject.scStateOutMsg.read()
+        return np.array(sc_state_payload.r_BN_N), np.array(sc_state_payload.v_BN_N)
 
-        #Apply J2 perburtations using oblated Earth
-        earth = self.grav_factory.createEarth()
-        earth.isCentralBody = True
 
-        #Path to gravitational field data
-        earthPath = simIncludeGravBody.Path()
-        earth.useSphericalHarmonicsGravityModel(earthPath + "/grav_data/GGM03S.txt", 2) # Degree 2 captures J2
 
-        # 2. Attach an atmospheric density model for realistic drag calculations
-        uniAtmosphere = exponentialAtmosphere.ExponentialAtmosphere()
-        uniAtmosphere.ModelTag = "exponentialAtmosphere"
-        uniAtmosphere.addSpacecraftToModel(self.satellites[0].scObject.scStateOutMsg)
-        # Standard scale height parameters for Earth's upper atmosphere
-        uniAtmosphere.baseDensity = 1.217  
-        self.sim.AddModelToTask(self.task_name, uniAtmosphere)
+def main():
 
-def run_continuous_simulation(enable_vizard=True):
-    # Initialize the rigorous environment with Vizard streaming enabled
-    env = RigorousEnvironment(
-        satellites=[RigorousEnvironment(sat_id="LEOSat_Prime")],
-        viz=enable_vizard,
-        sim_rate=1.0 # 1 second time step
+    #Setup Satellite Configuration
+    oe_setup = orbitalMotion.ClassicElements()
+    oe_setup.a = 6378137.0 + 550000.0  # Semi-major axis (meters)
+    oe_setup.e = 0.0001                # Eccentricity (near-circular)
+    oe_setup.i = 53.0 * macros.D2R     # Inclination (radians)
+    oe_setup.Omega = 12.0 * macros.D2R # RAAN (radians)
+    oe_setup.omega = 0.0               # Argument of Perigee (radians)
+    oe_setup.f = 0.2 * macros.D2R                  # True Anomaly (radians)
+
+    full_sat_args = MySatellite.default_sat_args(
+        oe=lambda: oe_setup
+    )
+    satellite = MySatellite(name="Taquee's Satellite", sat_args=full_sat_args)
+
+    env = gym.make(
+        "SatelliteTasking-v1",
+        satellite=satellite,
+        scenario=scene.UniformNadirScanning(),
+        rewarder=data.ScanningTimeReward(),
+        time_limit=5700.0,
+        log_level="WARNING",
+        vizard_dir="./vizard_output",
+        disable_env_checker=True,
+
+        # Injecting the Vizard core configurations
+        vizard_settings=dict(
+            orbitLinesOn=1,
+            trueTrajectoryLinesOn=1,
+            spacecraftCSon=1,
+            showLocationLabels=1,
+            showLocationCommLines=1,
+            storageDeviceGUIon=1,
+            ambient=0.4
+        ),
+        
     )
 
-    print("Initializing rigorous LEO simulation with J2 perturbations and drag...")
-    obs, info = env.reset()
+    try:
+        observation, info = env.reset(seed=1)
+        print("Environment initialized with custom satellite properties successfully.")
+        print("Initial observation:", observation)
 
-    print("Running continuous simulation loop. Open Vizard to observe the perturbed orbit.")
-    
-    # Run an extended simulation loop (e.g., multiple orbits; 5400 seconds is ~1 orbit)
-    step_count = 0
-    max_steps = 100 #Train later
-    
-    while step_count < max_steps:
-        # Sample or pass control actions (zero thrust for baseline orbital decay / J2 drift tracking)
-        action = env.action_space.sample() 
-        obs, reward, terminated, truncated, info = env.step(action)
+        for step in range(100):
+            observation, reward, terminated, truncated, info = env.step(0)
+
+            print(
+                f"Step {step + 1}: reward={reward}, "
+                f"terminated={terminated}, "
+                f"truncated={truncated}"
+            )
+            
+            #Get ECI satellite state vectors
+            satellite_data = env.unwrapped.satellites[0]
+            r_sat, v_sat = satellite_data.eci_data()
+
+
+            if terminated or truncated:
+                break
+
+            
         
-        step_count += 1
-        if terminated or truncated:
-            print("Environment reset triggered. Restarting episode...")
-            obs, info = env.reset()
 
-    print("Continuous simulation sequence completed.")
+        print("Custom property test completed successfully.")
+
+    finally:
+        try:
+            env.close()
+        except AttributeError:
+            pass
+
+
+#Pass in eci 3D vectors to compute for LVLH
+def convert_eci_to_lvlh(r_sat, v_sat, r_deb, v_deb):
+
+    #Relative eci
+    r_eci = r_deb - r_sat
+    v_eci = v_deb - v_sat
+
+    #Radial
+    norm = np.linalg.norm(r_sat)
+    radial_hat = r_sat / norm
+
+    #Cross Track
+    w_hat = np.cross(r_sat, v_sat)
+    norm = np.linalg.norm(w_hat)
+    w_hat = w_hat / norm
+
+    #Along-Track
+    s_hat = np.cross(w_hat, radial_hat)
+    norm = np.linalg.norm(s_hat)
+    s_hat = s_hat / norm
+
+    #Construct Rotation Matrix
+    rotation = np.array([radial_hat, s_hat, w_hat])
+
+    #Rotate position to LVLH
+    r_final = rotation @ r_eci #Since it is column based
+
+    #Correct velocity from coriolis effect
+    ang_vel = np.cross(r_sat, v_sat) / pow(np.linalg.norm(r_sat), 2)
+    v_corr = v_eci - (np.cross(ang_vel, r_eci))
+
+    #Rotate velocity to LVLH
+    v_final = rotation @ v_corr
+
+    return r_final, v_final
+
+def update_satellite_config():
+    
 
 if __name__ == "__main__":
-    run_continuous_simulation(enable_vizard=True)
+    main()
