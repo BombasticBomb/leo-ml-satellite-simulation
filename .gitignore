@@ -1,2 +1,6 @@
 env/
 references.txt
+tle_2025.parquet
+dataset.db
+dataset.sql
+vizard_output/
