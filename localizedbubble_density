@@ -1,0 +1,55 @@
+import numpy as np
+
+def calculate_orbital_congestion(
+    altitude_min_km=500.0,
+    altitude_max_km=600.0,
+    host_inclination_deg=53.0,
+    delta_inclination_deg=15.0,
+    cataloged_objects=15000,
+    awareness_radius_km=150.0
+):
+    """
+    Computes the local spatial density and expected number of neighboring 
+    objects within a satellite's awareness horizon in Low Earth Orbit (LEO).
+    """
+    R_E = 6371.0  # Earth's mean radius in km
+    
+    # 1. Calculate Full LEO Altitude Shell Volume (e.g., 500 to 600 km)
+    r_inner = R_E + altitude_min_km
+    r_outer = R_E + altitude_max_km
+    full_shell_vol = (4.0 / 3.0) * np.pi * (r_outer**3 - r_inner**3)
+    
+    # 2. Calculate Inclination Corridor Fraction (±Δi around host inclination)
+    lat1 = np.radians(host_inclination_deg - delta_inclination_deg)
+    lat2 = np.radians(host_inclination_deg + delta_inclination_deg)
+    surface_fraction = np.sin(lat2) - np.sin(lat1)
+    
+    # Volume of the targeted orbital inclination corridor
+    band_vol = full_shell_vol * surface_fraction
+    
+    # 3. Calculate Local Spatial Density (objects / km^3)
+    spatial_density = cataloged_objects / band_vol
+    
+    # 4. Calculate Satellite's Awareness Sphere Volume (R = 150 km)
+    sphere_vol = (4.0 / 3.0) * np.pi * (awareness_radius_km**3)
+    
+    # 5. Compute Expected Neighbors Inside the Awareness Horizon
+    expected_neighbors = spatial_density * sphere_vol
+    
+    # Print formatted summary
+    print("--- LEO Orbital Congestion Analysis ---")
+    print(f"Altitude Shell: {altitude_min_km} - {altitude_max_km} km")
+    print(f"Inclination Corridor: {host_inclination_deg}° ± {delta_inclination_deg}° ({surface_fraction*100:.1f}% of shell volume)")
+    print(f"Corridor Volume: {band_vol:,.2e} km³")
+    print(f"Localized Spatial Density: {spatial_density:.2e} objects/km³")
+    print(f"Awareness Sphere Volume (r={awareness_radius_km} km): {sphere_vol:,.2e} km³")
+    print(f"Expected Neighbors in Horizon: {expected_neighbors:.2f} objects\n")
+    
+    return {
+        "band_vol_km3": band_vol,
+        "spatial_density": spatial_density,
+        "expected_neighbors": expected_neighbors
+    }
+
+# Run the calculation with your parameters
+results = calculate_orbital_congestion()
